@@ -1,0 +1,264 @@
+---
+title: "CaSR-R568 RNA-seq"
+execute:
+  message: false
+  warning: false
+format: html
+editor: visual
+---
+
+*Paper:* [Iamartino et al. Effects of pharmacological calcimimetics on colorectal cancer cells over-expressing the human calcium-sensing receptor. 2020](https://doi.org/10.1016/j.bbamcr.2020.118836).
+
+*Studying the transcriptome effect of Calcium sensing receptor positive modulator R568 by RNA-seq.*
+
+*Tutorials followed:* [Law et al. RNA-seq analysis is easy as 1-2-3 with limma, Glimma and edgeR](https://f1000research.com/articles/5-1408).
+
+```{r}
+#| eval: false
+browseVignettes("edgeR")
+browseVignettes("limma")
+```
+
+# Data import
+
+Download raw count from [GSE140984](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE140984).
+
+Import
+
+```{r}
+counts <- read.delim(list.files(pattern = ".tsv"))
+rownames(counts) <- counts[,1] # first column is Ensembl gene ID
+counts <- counts[,-1]
+head(counts)
+```
+
+Make sample information
+
+```{r}
+samples <- data.frame(
+  factor(c(rep("empty", 6), rep("CaSR", 6))),
+  factor(c(rep(c(rep("DMSO", 3), rep("R568", 3)), 2)))
+)
+rownames(samples) <- colnames(counts)
+colnames(samples) <- c("GFP", "treatment")
+samples$group <- factor(paste0(samples$GFP, ".", samples$treatment))
+samples$GFP <- relevel(samples$GFP, "empty")
+samples
+```
+
+Make gene annotation
+
+```{r}
+ensembl <- substr(rownames(counts), 1, 15)
+library(org.Hs.eg.db)
+symbol <- mapIds(org.Hs.eg.db,
+                 keys = ensembl, 
+                 column = "SYMBOL",
+                 keytype = "ENSEMBL")
+entrez <- mapIds(org.Hs.eg.db,
+                 keys = ensembl, 
+                 column = "ENTREZID",
+                 keytype = "ENSEMBL")
+genes <- data.frame(symbol = symbol,
+                    entrezid = entrez)
+rownames(genes) <- rownames(counts)
+head(genes)
+```
+
+# Make DGEList object and preprocess
+
+```{r}
+library(edgeR)
+dge <- DGEList(counts = counts,
+               samples = samples,
+               genes = genes)
+dim(dge)
+```
+
+Filter low count genes and genes without annotations
+
+```{r}
+keep <- filterByExpr(dge, group = samples$group)
+summary(keep)
+hasannot <- rowSums(is.na(dge$genes)) == 0
+summary(hasannot)
+dge <- dge[keep & hasannot, , keep.lib.sizes = FALSE]
+dim(dge)
+```
+
+TMM normalization
+
+```{r}
+par(mfrow = c(1,2))
+log2cpm <- cpm(dge, log = TRUE)
+boxplot(log2cpm, las = 2) # before normalization, not much variation
+
+dge <- normLibSizes(dge) # newer function name for calcNormFactors
+log2cpm <- cpm(dge, log = TRUE)
+boxplot(log2cpm, las = 2) # after normalization
+```
+
+Examine MD plots of each samples
+
+```{r}
+#| fig-width: 10
+#| fig-height: 7
+par(mfrow = c(3,4))
+for (i in 1:12){
+  plotMD(log2cpm, column = i)
+  abline(h = 0, col = "red", lty = 2, lwd = 2)
+} # The counts are not too spread out from center indicating good normalization
+```
+
+# Data exploration
+
+Unsupervised clustering by MDS plot
+
+```{r}
+#| fig-width: 8
+#| fig-height: 8
+par(mfrow = c(1,1))
+points <- c(15,16,0,1)
+colors <- c("purple", "red", "gray", "green")
+plotMDS(log2cpm,
+        labels = samples$group,
+        col = colors[samples$group]) # We can see separations of CaSR+ samples
+```
+
+Make design matrix according to group
+
+```{r}
+design <- model.matrix(~ 0 + samples$group)
+colnames(design) <- levels(samples$group)
+design
+```
+
+Estimate dispersion
+
+```{r}
+#| fig-width: 7
+#| fig-height: 6
+dge <- estimateDisp(dge, design, robust = TRUE)
+plotBCV(dge) # Dispersion trend increases with counts then smooth out as expected
+```
+
+Squeeze dispersion to trend by QL (quasi-likelihood) approach to improve power
+
+```{r}
+#| fig-width: 7
+#| fig-height: 6
+fit <- glmQLFit(dge, design, robust = TRUE)
+plotQLDisp(fit)
+```
+
+# Differential expression 
+
+## edgeR pipeline
+
+We test CaSR+ samples only
+
+```{r}
+#| fig-width: 7
+#| fig-height: 6
+con <- makeContrasts(treated = CaSR.R568 - empty.DMSO,
+                     untreated = CaSR.DMSO - empty.DMSO,
+                     levels = design)
+
+qlf <- glmQLFTest(fit, contrast = con)
+topTags(qlf)
+summary(decideTests(qlf))
+plotMD(qlf)
+
+tr <- glmTreat(fit, contrast = con[,1], lfc = 1) # Test for genes with log2FC > 1 for CaSR.R568
+topTags(tr)
+summary(decideTests(tr))
+plotMD(tr)
+```
+
+## limma-voom pipeline
+
+```{r}
+v <- voom(dge, design, plot = TRUE) # genes with high count but not decrease with variance means biological variation
+vfit <- lmFit(v, design)
+vfit <- contrasts.fit(vfit, contrasts = con)
+efit <- eBayes(vfit)
+plotSA(efit)
+topTable(efit)
+summary(decideTests(efit))
+
+tfit <- treat(vfit, lfc = 1)
+topTreat(tfit, coef = 1)
+summary(decideTests(tfit))
+```
+
+## voom with quality weights pipeline
+
+```{r}
+vwts <- voomWithQualityWeights(dge, design, plot = TRUE) # big difference in quality weights between samples
+vwfit <- lmFit(vwts)
+vwfit <- contrasts.fit(vwfit, contrasts = con)
+vwfit <- eBayes(vwfit)
+topTable(vwfit)
+summary(decideTests(vwfit))
+
+twfit <- treat(vwfit, lfc = 1)
+topTreat(twfit, coef = 1)
+summary(decideTests(twfit))
+```
+
+## Compare heatmaps of 3 pipelines
+
+```{r}
+#| fig-width: 7
+#| fig-height: 10
+library(gplots)
+col <- colorpanel(1000,"blue","white","red")
+topgenes1 <- rownames(topTags(qlf, n = 500))
+topgenes2 <- rownames(topTable(efit, n = 500))
+topgenes3 <- rownames(topTable(vwfit, n = 500))
+topgenes_list <- list(topgenes1, topgenes2, topgenes3)
+
+for (i in 1:3){
+  ind <- which(rownames(dge$genes) %in% topgenes_list[[i]])
+  heatmap.2(log2cpm[ind,], 
+            labRow = dge$genes$symbol[ind],
+            labCol = samples$group,
+            col = col,
+            trace = "none",
+            scale = "row",
+            dendrogram = "column",
+            density.info = "none",
+            margins = c(7, 5),
+            lhei = c(2, 10))
+} # some difference in gene clustering
+```
+
+# Gene set testing
+
+## edgeR pipeline
+
+Test GO_BP gene set
+
+```{r}
+go <- goana(qlf, geneid = qlf$genes$entrezid) # it needs entrezID
+gobp <- topGO(go, ontology = "BP")
+topGO(go, ontology = "BP")
+```
+
+## limma pipeline
+
+Test 2 GO_BP gene sets for CaSR.R568
+
+```{r}
+library(GO.db)
+select(GO.db,
+       keys = c("cell migration", "cell differentiation"),
+       keytype = "TERM",
+       column = "GOID")
+Rkeys(org.Hs.egGO2ALLEGS) <- c("GO:0016477", "GO:0030154")
+idx <- ids2indices(as.list(org.Hs.egGO2ALLEGS), id = v$genes$entrezid)
+mroast(v, idx, design, contrast = con[,1]) # both up
+camera(v, idx, design, contrast = con[,1]) # only cell migration significant
+fry(v, idx, design, contrast = con[,1]) # both up
+barcodeplot(efit$t[,1], index = idx$`GO:0016477`)
+```
